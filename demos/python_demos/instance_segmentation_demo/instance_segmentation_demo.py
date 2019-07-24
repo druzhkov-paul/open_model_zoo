@@ -114,6 +114,30 @@ def segm_postprocess(box, raw_cls_mask, im_h, im_w):
     return im_mask
 
 
+def preprocess(frame, input_blob_shape, no_keep_aspect_ratio=False):
+    n, c, h, w = input_blob_shape
+    if no_keep_aspect_ratio:
+        # Resize the image to a target size.
+        scale_x = w / frame.shape[1]
+        scale_y = h / frame.shape[0]
+        input_image = cv2.resize(frame, (w, h))
+    else:
+        # Resize the image to keep the same aspect ratio and to fit it to a window of a target size.
+        scale_x = scale_y = min(h / frame.shape[0], w / frame.shape[1])
+        input_image = cv2.resize(frame, None, fx=scale_x, fy=scale_y)
+
+    input_image_size = input_image.shape[:2]
+    input_image = np.pad(input_image, ((0, h - input_image_size[0]),
+                                       (0, w - input_image_size[1]),
+                                       (0, 0)),
+                         mode='constant', constant_values=0)
+    # Change data layout from HWC to CHW.
+    input_image = input_image.transpose((2, 0, 1))
+    input_image = input_image.reshape((n, c, h, w)).astype(np.float32)
+    input_image_info = np.asarray([[input_image_size[0], input_image_size[1], 1]], dtype=np.float32)
+    return {'im_data': input_image, 'im_info': input_image_info}, (scale_x, scale_y)
+
+
 def main():
     log.basicConfig(format='[ %(levelname)s ] %(message)s', level=log.INFO, stream=sys.stdout)
     args = build_argparser().parse_args()
@@ -162,6 +186,7 @@ def main():
     if not cap.isOpened():
         log.error('Failed to open "{}"'.format(args.input_source))
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    ret, frame = cap.read()
 
     if args.no_track:
         tracker = None
@@ -174,95 +199,118 @@ def main():
     visualizer = Visualizer(class_labels, show_boxes=args.show_boxes, show_scores=args.show_scores)
 
     render_time = 0
+    pipeline_start = time.time()
+    fps = None
 
     log.info('Starting inference...')
+    is_async_mode = True
+    cur_request_id = 0
+    next_request_id = 1
     print("To close the application, press 'CTRL+C' here or switch to the output window and press ESC key")
     while cap.isOpened():
-        ret, frame = cap.read()
+        frame_read_start = time.time()
+        if is_async_mode:
+            ret, next_frame = cap.read()
+        else:
+            ret, frame = cap.read()
+        frame_read_end = time.time()
+        frame_read_time = frame_read_end - frame_read_start
         if not ret:
             break
 
-        if args.no_keep_aspect_ratio:
-            # Resize the image to a target size.
-            scale_x = w / frame.shape[1]
-            scale_y = h / frame.shape[0]
-            input_image = cv2.resize(frame, (w, h))
-        else:
-            # Resize the image to keep the same aspect ratio and to fit it to a window of a target size.
-            scale_x = scale_y = min(h / frame.shape[0], w / frame.shape[1])
-            input_image = cv2.resize(frame, None, fx=scale_x, fy=scale_y)
-
-        input_image_size = input_image.shape[:2]
-        input_image = np.pad(input_image, ((0, h - input_image_size[0]),
-                                           (0, w - input_image_size[1]),
-                                           (0, 0)),
-                             mode='constant', constant_values=0)
-        # Change data layout from HWC to CHW.
-        input_image = input_image.transpose((2, 0, 1))
-        input_image = input_image.reshape((n, c, h, w)).astype(np.float32)
-        input_image_info = np.asarray([[input_image_size[0], input_image_size[1], 1]], dtype=np.float32)
-
-        # Run the net.
         inf_start = time.time()
-        outputs = exec_net.infer({'im_data': input_image, 'im_info': input_image_info})
-        inf_end = time.time()
-        det_time = inf_end - inf_start
+        if is_async_mode:
+            preproc_start = time.time()
+            feed_dict, (scale_x, scale_y) = preprocess(next_frame, [n, c, h, w], args.no_keep_aspect_ratio)
+            preproc_end = time.time()
+            preproc_time = preproc_end - preproc_start
+            exec_net.start_async(request_id=next_request_id, inputs=feed_dict)
+        else:
+            preproc_start = time.time()
+            feed_dict, (scale_x, scale_y) = preprocess(frame, [n, c, h, w], args.no_keep_aspect_ratio)
+            preproc_end = time.time()
+            preproc_time = preproc_end - preproc_start
+            exec_net.start_async(request_id=cur_request_id, inputs=feed_dict)
+        if exec_net.requests[cur_request_id].wait(-1) == 0:
+            # Parse detection results of the current request
+            outputs = exec_net.requests[cur_request_id].outputs
 
-        # Parse detection results of the current request
-        boxes = outputs['boxes']
-        boxes[:, 0::2] /= scale_x
-        boxes[:, 1::2] /= scale_y
-        scores = outputs['scores']
-        classes = outputs['classes'].astype(np.uint32)
-        masks = []
-        for box, cls, raw_mask in zip(boxes, classes, outputs['raw_masks']):
-            raw_cls_mask = raw_mask[cls, ...]
-            mask = segm_postprocess(box, raw_cls_mask, frame.shape[0], frame.shape[1])
-            masks.append(mask)
+            inf_end = time.time()
+            det_time = inf_end - inf_start
 
-        # Filter out detections with low confidence.
-        detections_filter = scores > args.prob_threshold
-        scores = scores[detections_filter]
-        classes = classes[detections_filter]
-        boxes = boxes[detections_filter]
-        masks = list(segm for segm, is_valid in zip(masks, detections_filter) if is_valid)
+            # Parse detection results of the current request
+            boxes = outputs['boxes']
+            boxes[:, 0::2] /= scale_x
+            boxes[:, 1::2] /= scale_y
+            scores = outputs['scores']
+            classes = outputs['classes'].astype(np.uint32)
+            masks = []
+            for box, cls, raw_mask in zip(boxes, classes, outputs['raw_masks']):
+                raw_cls_mask = raw_mask[cls, ...]
+                mask = segm_postprocess(box, raw_cls_mask, frame.shape[0], frame.shape[1])
+                masks.append(mask)
 
-        render_start = time.time()
+            # Filter out detections with low confidence.
+            detections_filter = scores > args.prob_threshold
+            scores = scores[detections_filter]
+            classes = classes[detections_filter]
+            boxes = boxes[detections_filter]
+            masks = list(segm for segm, is_valid in zip(masks, detections_filter) if is_valid)
 
-        if len(boxes) and args.raw_output_message:
-            log.info('Detected boxes:')
-            log.info('  Class ID | Confidence |     XMIN |     YMIN |     XMAX |     YMAX ')
-            for box, cls, score, mask in zip(boxes, classes, scores, masks):
-                log.info('{:>10} | {:>10f} | {:>8.2f} | {:>8.2f} | {:>8.2f} | {:>8.2f} '.format(cls, score, *box))
+            render_start = time.time()
 
-        # Get instance track IDs.
-        masks_tracks_ids = None
-        if tracker is not None:
-            masks_tracks_ids = tracker(masks, classes)
+            if len(boxes) and args.raw_output_message:
+                log.info('Detected boxes:')
+                log.info('  Class ID | Confidence |     XMIN |     YMIN |     XMAX |     YMAX ')
+                for box, cls, score, mask in zip(boxes, classes, scores, masks):
+                    log.info('{:>10} | {:>10f} | {:>8.2f} | {:>8.2f} | {:>8.2f} | {:>8.2f} '.format(cls, score, *box))
 
-        # Visualize masks.
-        frame = visualizer(frame, boxes, classes, scores, masks, masks_tracks_ids)
+            # Get instance track IDs.
+            masks_tracks_ids = None
+            if tracker is not None:
+                masks_tracks_ids = tracker(masks, classes)
 
-        # Draw performance stats.
-        inf_time_message = 'Inference time: {:.3f} ms'.format(det_time * 1000)
-        render_time_message = 'OpenCV rendering time: {:.3f} ms'.format(render_time * 1000)
-        cv2.putText(frame, inf_time_message, (15, 15), cv2.FONT_HERSHEY_COMPLEX, 0.5, (200, 10, 10), 1)
-        cv2.putText(frame, render_time_message, (15, 30), cv2.FONT_HERSHEY_COMPLEX, 0.5, (10, 10, 200), 1)
+            # Visualize masks.
+            frame = visualizer(frame, boxes, classes, scores, masks, masks_tracks_ids)
 
-        # Print performance counters.
-        if args.perf_counts:
-            perf_counts = exec_net.requests[0].get_perf_counts()
-            log.info('Performance counters:')
-            print('{:<70} {:<15} {:<15} {:<15} {:<10}'.format('name', 'layer_type', 'exet_type', 'status',
-                                                              'real_time, us'))
-            for layer, stats in perf_counts.items():
-                print('{:<70} {:<15} {:<15} {:<15} {:<10}'.format(layer, stats['layer_type'], stats['exec_type'],
-                                                                  stats['status'], stats['real_time']))
+            # Draw performance stats.
+            inf_time_message = 'Inference time: {:.3f} ms'.format(det_time * 1000)
+            render_time_message = 'OpenCV rendering time: {:.3f} ms'.format(render_time * 1000)
+            preproc_time_message = 'frame_read_time: {:.3f} ms'.format(frame_read_time * 1000)
+            cv2.putText(frame, inf_time_message, (15, 15), cv2.FONT_HERSHEY_COMPLEX, 0.5, (200, 10, 10), 1)
+            cv2.putText(frame, render_time_message, (15, 30), cv2.FONT_HERSHEY_COMPLEX, 0.5, (10, 10, 200), 1)
+            cv2.putText(frame, preproc_time_message, (15, 45), cv2.FONT_HERSHEY_COMPLEX, 0.5, (200, 200, 10), 1)
+
+            pipeline_end = time.time()
+            pipeline_time = pipeline_end - pipeline_start
+            pipeline_start = time.time()
+            if fps is None:
+                fps = 1 / pipeline_time
+            else:
+                alpha = 0.95
+                fps = fps * alpha + (1 / pipeline_time) * (1 - alpha)
+            pipeline_time_message = 'FPS: {:.1f}'.format(fps)
+            cv2.putText(frame, pipeline_time_message, (15, 60), cv2.FONT_HERSHEY_COMPLEX, 0.5, (200, 200, 10), 1)
+
+            # Print performance counters.
+            if args.perf_counts:
+                perf_counts = exec_net.requests[0].get_perf_counts()
+                log.info('Performance counters:')
+                print('{:<70} {:<15} {:<15} {:<15} {:<10}'.format('name', 'layer_type', 'exet_type', 'status',
+                                                                  'real_time, us'))
+                for layer, stats in perf_counts.items():
+                    print('{:<70} {:<15} {:<15} {:<15} {:<10}'.format(layer, stats['layer_type'], stats['exec_type'],
+                                                                      stats['status'], stats['real_time']))
+
+            render_end = time.time()
+            render_time = render_end - render_start
 
         # Show resulting image.
         cv2.imshow('Results', frame)
-        render_end = time.time()
-        render_time = render_end - render_start
+
+        if is_async_mode:
+            cur_request_id, next_request_id = next_request_id, cur_request_id
+            frame = next_frame
 
         key = cv2.waitKey(args.delay)
         esc_code = 27
