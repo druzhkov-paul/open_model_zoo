@@ -255,13 +255,15 @@ struct StaticIOUTracker{
     float iou_threshold;
     int age_threshold;
     int last_id;
+    bool enable;
     std::vector<Detection> history;
 
-    StaticIOUTracker(float iou_threshold=0.5f, int age_threshold=10) {
+    StaticIOUTracker(float iou_threshold=0.5f, int age_threshold=10, bool enable=true) {
         this->iou_threshold = iou_threshold;
         this->age_threshold = age_threshold;
         this->history.clear();
         this->last_id = 0;
+        this->enable = enable;
     }
 
     cv::Mat affinity(std::vector<Detection>& candidates) {
@@ -287,6 +289,14 @@ struct StaticIOUTracker{
     }
 
     void operator()(std::vector<Detection>& candidates) {
+        if (!enable) {
+            last_id = 0;
+            for (auto& c: candidates) {
+                c.id = last_id++;
+            }
+            return;
+        }
+
         for (auto& h: history) {
             h.age++;
         }
@@ -508,13 +518,15 @@ int main(int argc, char *argv[]) {
         StaticIOUTracker tracker;
 
         bool isLastFrame = false;
-        bool isAsyncMode = false;  // execution is always started using SYNC mode
+        bool isAsyncMode = true;  // execution is always started using SYNC mode
         bool isModeChanged = false;  // set to TRUE when execution mode is changed (SYNC<->ASYNC)
 
         typedef std::chrono::duration<double, std::ratio<1, 1000>> ms;
         auto total_t0 = std::chrono::high_resolution_clock::now();
         auto wallclock = std::chrono::high_resolution_clock::now();
         double ocv_decode_time = 0, ocv_render_time = 0;
+        float fps = -1.0f;
+        const float fps_alpha = 0.9f;
 
         std::cout << "To close the application, press 'CTRL+C' here or switch to the output window and press ESC key" << std::endl;
         std::cout << "To switch between sync/async modes, press TAB key in the output window" << std::endl;
@@ -569,60 +581,34 @@ int main(int argc, char *argv[]) {
                 ms wall = std::chrono::duration_cast<ms>(t0 - wallclock);
                 wallclock = t0;
 
-                t0 = std::chrono::high_resolution_clock::now();
+                fps = fps * fps_alpha + (1000.f / wall.count()) * (1.0f - fps_alpha);
                 std::ostringstream out;
-                out << "OpenCV cap/render time: " << std::fixed << std::setprecision(2)
-                    << (ocv_decode_time + ocv_render_time) << " ms";
-                cv::putText(curr_frame, out.str(), cv::Point2f(0, 25), cv::FONT_HERSHEY_TRIPLEX, 0.6, cv::Scalar(0, 255, 0));
-                out.str("");
-                out << "Wallclock time " << (isAsyncMode ? "(TRUE ASYNC):      " : "(SYNC, press Tab): ");
-                out << std::fixed << std::setprecision(2) << wall.count() << " ms (" << 1000.f / wall.count() << " fps)";
-                cv::putText(curr_frame, out.str(), cv::Point2f(0, 50), cv::FONT_HERSHEY_TRIPLEX, 0.6, cv::Scalar(0, 0, 255));
-                if (!isAsyncMode) {  // In the true async mode, there is no way to measure detection time directly
-                    out.str("");
-                    out << "Detection time  : " << std::fixed << std::setprecision(2) << detection.count()
-                        << " ms ("
-                        << 1000.f / detection.count() << " fps)";
-                    cv::putText(curr_frame, out.str(), cv::Point2f(0, 75), cv::FONT_HERSHEY_TRIPLEX, 0.6,
-                                cv::Scalar(255, 0, 0));
-                }
+                out << "FPS: " << std::fixed << std::setprecision(1) << fps;
+                cv::putText(curr_frame, out.str(), cv::Point2f(0, 25), cv::FONT_HERSHEY_TRIPLEX, 0.6, cv::Scalar(0, 0, 255));
+
+                ocv_decode_time = ocv_render_time;
+                ocv_render_time = ocv_decode_time;
+
+//                t0 = std::chrono::high_resolution_clock::now();
+//                std::ostringstream out;
+//                out << "OpenCV cap/render time: " << std::fixed << std::setprecision(2)
+//                    << (ocv_decode_time + ocv_render_time) << " ms";
+//                cv::putText(curr_frame, out.str(), cv::Point2f(0, 25), cv::FONT_HERSHEY_TRIPLEX, 0.6, cv::Scalar(0, 255, 0));
+//                out.str("");
+//                out << "Wallclock time " << (isAsyncMode ? "(TRUE ASYNC):      " : "(SYNC, press Tab): ");
+//                out << std::fixed << std::setprecision(2) << wall.count() << " ms (" << 1000.f / wall.count() << " fps)";
+//                cv::putText(curr_frame, out.str(), cv::Point2f(0, 50), cv::FONT_HERSHEY_TRIPLEX, 0.6, cv::Scalar(0, 0, 255));
+//                if (!isAsyncMode) {  // In the true async mode, there is no way to measure detection time directly
+//                    out.str("");
+//                    out << "Detection time  : " << std::fixed << std::setprecision(2) << detection.count()
+//                        << " ms ("
+//                        << 1000.f / detection.count() << " fps)";
+//                    cv::putText(curr_frame, out.str(), cv::Point2f(0, 75), cv::FONT_HERSHEY_TRIPLEX, 0.6,
+//                                cv::Scalar(255, 0, 0));
+//                }
 
                 // ---------------------------Process output blobs--------------------------------------------------
                 // Processing results of the CURRENT request
-                /*
-                boxes = outputs['boxes']
-                if len(boxes) > 0:
-                    boxes[:, 0::2] /= scale_x
-                    boxes[:, 1::2] /= scale_y
-                    scores = outputs['scores']
-                    classes = outputs['classes'].astype(np.uint32)
-                    masks = []
-                    for box, cls, raw_mask in zip(boxes, classes, outputs['raw_masks']):
-                        raw_cls_mask = raw_mask[cls, ...]
-                        mask = segm_postprocess(box, raw_cls_mask, frame.shape[0], frame.shape[1])
-                        masks.append(mask)
-
-                    # Filter out detections with low confidence.
-                    detections_filter = scores > args.prob_threshold
-                    scores = scores[detections_filter]
-                    classes = classes[detections_filter]
-                    boxes = boxes[detections_filter]
-                    masks = list(segm for segm, is_valid in zip(masks, detections_filter) if is_valid)
-
-                    if len(boxes) and args.raw_output_message:
-                        log.info('Detected boxes:')
-                        log.info('  Class ID | Confidence |     XMIN |     YMIN |     XMAX |     YMAX ')
-                        for box, cls, score, mask in zip(boxes, classes, scores, masks):
-                            log.info('{:>10} | {:>10f} | {:>8.2f} | {:>8.2f} | {:>8.2f} | {:>8.2f} '.format(cls, score, *box))
-
-                    # Get instance track IDs.
-                    masks_tracks_ids = None
-                    if tracker is not None:
-                        masks_tracks_ids = tracker(masks, classes)
-
-                    # Visualize masks.
-                    frame = visualizer(frame, boxes, classes, scores, masks, masks_tracks_ids)
-                */
                 const float *boxes = async_infer_request_curr->GetBlob("boxes")->buffer().as<PrecisionTrait<Precision::FP32>::value_type*>();
                 const float *classes = async_infer_request_curr->GetBlob("classes")->buffer().as<PrecisionTrait<Precision::FP32>::value_type*>();
                 const float *scores = async_infer_request_curr->GetBlob("scores")->buffer().as<PrecisionTrait<Precision::FP32>::value_type*>();
