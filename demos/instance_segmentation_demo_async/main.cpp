@@ -247,8 +247,6 @@ int main(int argc, char *argv[]) {
         }
         const size_t width  = (size_t) cap.get(cv::CAP_PROP_FRAME_WIDTH);
         const size_t height = (size_t) cap.get(cv::CAP_PROP_FRAME_HEIGHT);
-//        const size_t width = 480;
-//        const size_t height = 480;
 
         // read input (video) frame
         cv::Mat curr_frame;  cap >> curr_frame;
@@ -562,19 +560,15 @@ int main(int argc, char *argv[]) {
                                            const_cast<float*>(&raw_masks[(i * num_classes + label) * rawMaskWidth * rawMaskHeight]));
                         auto mask = segm_postprocess(cv::Rect2f(cv::Point2f(xmin, ymin), cv::Point2f(xmax, ymax)),
                                                      raw_mask, height, width);
-                        // cv::imshow("mask", mask);
-                        // cv::waitKey(0);
                         overlay_mask(curr_frame, mask, i);
 
-                        /** Drawing only objects when > confidence_threshold probability **/
-//                        std::ostringstream conf;
-//                        conf << ":" << std::fixed << std::setprecision(3) << confidence;
-//                        cv::putText(curr_frame,
-//                                    (static_cast<size_t>(label) < labels.size() ?
-//                                    labels[label] : std::string("label #") + std::to_string(label)) + conf.str(),
-//                                    cv::Point2f(xmin, ymin - 5), cv::FONT_HERSHEY_COMPLEX_SMALL, 1,
-//                                    cv::Scalar(0, 0, 255));
-//                        cv::rectangle(curr_frame, cv::Point2f(xmin, ymin), cv::Point2f(xmax, ymax), cv::Scalar(0, 0, 255));
+                        const auto& message = labels[label];
+                        int baseline = 0;
+                        auto textsize = cv::getTextSize(message, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+                        cv::Point position((xmax + xmin - textsize.width) / 2,
+                                           (ymax + ymin - textsize.height) / 2);
+                        cv::putText(curr_frame, message, position, cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                                    cv::Scalar(255, 255, 255), 1);
                     }
                 }
             }
