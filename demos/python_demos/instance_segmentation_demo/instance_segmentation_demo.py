@@ -234,44 +234,44 @@ def main():
         if exec_net.requests[cur_request_id].wait(-1) == 0:
             # Parse detection results of the current request
             outputs = exec_net.requests[cur_request_id].outputs
+            # outputs = {'boxes': [], 'scores': [], 'classes': [], 'raw_masks': []}
 
             inf_end = time.time()
             det_time = inf_end - inf_start
 
             # Parse detection results of the current request
             boxes = outputs['boxes']
-            boxes[:, 0::2] /= scale_x
-            boxes[:, 1::2] /= scale_y
-            scores = outputs['scores']
-            classes = outputs['classes'].astype(np.uint32)
-            masks = []
-            for box, cls, raw_mask in zip(boxes, classes, outputs['raw_masks']):
-                raw_cls_mask = raw_mask[cls, ...]
-                mask = segm_postprocess(box, raw_cls_mask, frame.shape[0], frame.shape[1])
-                masks.append(mask)
+            if len(boxes) > 0:
+                boxes[:, 0::2] /= scale_x
+                boxes[:, 1::2] /= scale_y
+                scores = outputs['scores']
+                classes = outputs['classes'].astype(np.uint32)
+                masks = []
+                for box, cls, raw_mask in zip(boxes, classes, outputs['raw_masks']):
+                    raw_cls_mask = raw_mask[cls, ...]
+                    mask = segm_postprocess(box, raw_cls_mask, frame.shape[0], frame.shape[1])
+                    masks.append(mask)
 
-            # Filter out detections with low confidence.
-            detections_filter = scores > args.prob_threshold
-            scores = scores[detections_filter]
-            classes = classes[detections_filter]
-            boxes = boxes[detections_filter]
-            masks = list(segm for segm, is_valid in zip(masks, detections_filter) if is_valid)
+                # Filter out detections with low confidence.
+                detections_filter = scores > args.prob_threshold
+                scores = scores[detections_filter]
+                classes = classes[detections_filter]
+                boxes = boxes[detections_filter]
+                masks = list(segm for segm, is_valid in zip(masks, detections_filter) if is_valid)
 
-            render_start = time.time()
+                if len(boxes) and args.raw_output_message:
+                    log.info('Detected boxes:')
+                    log.info('  Class ID | Confidence |     XMIN |     YMIN |     XMAX |     YMAX ')
+                    for box, cls, score, mask in zip(boxes, classes, scores, masks):
+                        log.info('{:>10} | {:>10f} | {:>8.2f} | {:>8.2f} | {:>8.2f} | {:>8.2f} '.format(cls, score, *box))
 
-            if len(boxes) and args.raw_output_message:
-                log.info('Detected boxes:')
-                log.info('  Class ID | Confidence |     XMIN |     YMIN |     XMAX |     YMAX ')
-                for box, cls, score, mask in zip(boxes, classes, scores, masks):
-                    log.info('{:>10} | {:>10f} | {:>8.2f} | {:>8.2f} | {:>8.2f} | {:>8.2f} '.format(cls, score, *box))
+                # Get instance track IDs.
+                masks_tracks_ids = None
+                if tracker is not None:
+                    masks_tracks_ids = tracker(masks, classes)
 
-            # Get instance track IDs.
-            masks_tracks_ids = None
-            if tracker is not None:
-                masks_tracks_ids = tracker(masks, classes)
-
-            # Visualize masks.
-            frame = visualizer(frame, boxes, classes, scores, masks, masks_tracks_ids)
+                # Visualize masks.
+                frame = visualizer(frame, boxes, classes, scores, masks, masks_tracks_ids)
 
             # Draw performance stats.
             inf_time_message = 'Inference time: {:.3f} ms'.format(det_time * 1000)
@@ -302,9 +302,7 @@ def main():
                     print('{:<70} {:<15} {:<15} {:<15} {:<10}'.format(layer, stats['layer_type'], stats['exec_type'],
                                                                       stats['status'], stats['real_time']))
 
-            render_end = time.time()
-            render_time = render_end - render_start
-
+        render_start = time.time()
         # Show resulting image.
         cv2.imshow('Results', frame)
 
@@ -316,6 +314,9 @@ def main():
         esc_code = 27
         if key == esc_code:
             break
+
+        render_end = time.time()
+        render_time = render_end - render_start
 
     cv2.destroyAllWindows()
     cap.release()
