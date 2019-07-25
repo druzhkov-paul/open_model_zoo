@@ -230,6 +230,101 @@ void overlay_mask(cv::Mat& image, const cv::Mat& mask, const int id=-1) {
 }
 
 
+struct Detection {
+    cv::Mat mask;
+    cv::Rect2f box;
+    int label;
+    float score;
+    float area {0.0};
+    int age {0};
+    int id {-1};
+
+    Detection(const cv::Rect2f& box, const cv::Mat& mask, int label, float score) {
+        this->box = box;
+        this->mask = mask;
+        this->label = label;
+        this->score = score;
+        area = cv::countNonZero(mask);
+        age = 0;
+        id = -1;
+    }
+};
+
+
+struct StaticIOUTracker{
+    float iou_threshold;
+    int age_threshold;
+    int last_id;
+    std::vector<Detection> history;
+
+    StaticIOUTracker(float iou_threshold=0.5f, int age_threshold=10) {
+        this->iou_threshold = iou_threshold;
+        this->age_threshold = age_threshold;
+        this->history.clear();
+        this->last_id = 0;
+    }
+
+    cv::Mat affinity(std::vector<Detection>& candidates) {
+        cv::Mat affinity_matrix = cv::Mat::zeros(candidates.size(), history.size(), CV_32F);
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            const auto& mask = candidates[i].mask;
+            candidates[i].area = cv::countNonZero(mask);
+            const float area = candidates[i].area;
+            const auto& box = candidates[i].box;
+            for (size_t j = 0; j < history.size(); ++j) {
+                const auto& hmask = history[j].mask;
+                const float harea = history[j].area;
+                if ((history[j].box & box).area() > 0) {
+                    cv::Mat mask_intersection;
+                    cv::bitwise_and(hmask, mask, mask_intersection);
+                    float intersection_area = cv::countNonZero(mask_intersection);
+                    float union_area = harea + area - intersection_area;
+                    affinity_matrix.at<float>(i, j) = intersection_area / union_area;
+                }
+            }
+        }
+        return affinity_matrix;
+    }
+
+    void operator()(std::vector<Detection>& candidates) {
+        for (auto& h: history) {
+            h.age++;
+        }
+
+        auto affinity_matrix = affinity(candidates);
+
+        double minVal, maxVal;
+        cv::Point minLoc, maxLoc;
+        for (size_t i = 0; i < std::min(candidates.size(), history.size()); ++i) {
+            cv::minMaxLoc(affinity_matrix, &minVal, &maxVal, &minLoc, &maxLoc);
+            auto iou = affinity_matrix.at<float>(maxLoc);
+            assert(affinity_matrix.at<float>(maxLoc) == affinity_matrix.at<float>(maxLoc.y, maxLoc.x));
+            if (iou > iou_threshold) {
+                candidates[maxLoc.y].id = history[maxLoc.x].id;
+                history[maxLoc.x] = candidates[maxLoc.y];
+                history[maxLoc.x].age = 0;
+                affinity_matrix.row(maxLoc.y).setTo(-1);
+                affinity_matrix.col(maxLoc.x).setTo(-1);
+            } else {
+                break;
+            }
+        }
+
+        for (auto& c: candidates) {
+            if (c.id < 0) {
+                c.id = last_id++;
+                history.emplace_back(c);
+            }
+        }
+
+        auto last = std::remove_if(history.begin(), history.end(),
+                                   [&](const Detection& d) {return d.age > age_threshold;});
+        history.erase(last, history.end());
+    }
+
+};
+
+
 int main(int argc, char *argv[]) {
     try {
         /** This demo covers certain topology and cannot be generalized for any object detection **/
@@ -410,6 +505,7 @@ int main(int argc, char *argv[]) {
 
         // --------------------------- 6. Do inference ---------------------------------------------------------
         slog::info << "Start inference " << slog::endl;
+        StaticIOUTracker tracker;
 
         bool isLastFrame = false;
         bool isAsyncMode = false;  // execution is always started using SYNC mode
@@ -535,6 +631,8 @@ int main(int argc, char *argv[]) {
                 const int objectSize = 4;
                 const float scale_x = static_cast<float>(netInputWidth) / width;
                 const float scale_y = static_cast<float>(netInputHeight) / height;
+                std::vector<Detection> detections;
+
                 for (int i = 0; i < maxDetectionsCount; i++) {
                     float image_id = 0;
                     if (image_id < 0) {
@@ -557,22 +655,28 @@ int main(int argc, char *argv[]) {
 
                     if (confidence > FLAGS_t) {
                         const cv::Mat raw_mask(rawMaskHeight, rawMaskWidth, CV_32FC1,
-                                           const_cast<float*>(&raw_masks[(i * num_classes + label) * rawMaskWidth * rawMaskHeight]));
-                        auto mask = segm_postprocess(cv::Rect2f(cv::Point2f(xmin, ymin), cv::Point2f(xmax, ymax)),
-                                                     raw_mask, height, width);
-                        overlay_mask(curr_frame, mask, i);
-
-                        const auto& message = labels[label];
-                        int baseline = 0;
-                        auto textsize = cv::getTextSize(message, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
-                        cv::Point position((xmax + xmin - textsize.width) / 2,
-                                           (ymax + ymin - textsize.height) / 2);
-                        cv::putText(curr_frame, message, position, cv::FONT_HERSHEY_SIMPLEX, 0.5,
-                                    cv::Scalar(255, 255, 255), 1);
+                            const_cast<float*>(&raw_masks[(i * num_classes + label) * rawMaskWidth * rawMaskHeight]));
+                        cv::Rect2f box(cv::Point2f(xmin, ymin), cv::Point2f(xmax, ymax));
+                        auto mask = segm_postprocess(box, raw_mask, height, width);
+                        detections.emplace_back(box, mask, label, confidence);
                     }
                 }
+
+                tracker(detections);
+
+                for (const auto& d: detections) {
+                    overlay_mask(curr_frame, d.mask, d.id);
+                    const auto& message = labels[d.label];
+                    int baseline = 0;
+                    auto textsize = cv::getTextSize(message, cv::FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseline);
+                    cv::Point position((d.box.tl().x + d.box.br().x - textsize.width) / 2,
+                                       (d.box.tl().y + d.box.br().y - textsize.height) / 2);
+                    cv::putText(curr_frame, message, position, cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                                cv::Scalar(255, 255, 255), 1);
+                }
+
             }
-            cv::imshow("Detection results", curr_frame);
+            cv::imshow("results", curr_frame);
 
             t1 = std::chrono::high_resolution_clock::now();
             ocv_render_time = std::chrono::duration_cast<ms>(t1 - t0).count();
