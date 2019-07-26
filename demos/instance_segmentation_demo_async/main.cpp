@@ -62,37 +62,6 @@ void frameToBlob(const cv::Mat& frame,
 }
 
 
-//def expand_box(box, scale):
-//    w_half = (box[2] - box[0]) * .5
-//    h_half = (box[3] - box[1]) * .5
-//    x_c = (box[2] + box[0]) * .5
-//    y_c = (box[3] + box[1]) * .5
-//    w_half *= scale
-//    h_half *= scale
-//    box_exp = np.zeros(box.shape)
-//    box_exp[0] = x_c - w_half
-//    box_exp[2] = x_c + w_half
-//    box_exp[1] = y_c - h_half
-//    box_exp[3] = y_c + h_half
-//    return box_exp
-//
-//
-//def segm_postprocess(box, raw_cls_mask, im_h, im_w):
-//    # Add zero border to prevent upsampling artifacts on segment borders.
-//    raw_cls_mask = np.pad(raw_cls_mask, ((1, 1), (1, 1)), 'constant', constant_values=0)
-//    extended_box = expand_box(box, raw_cls_mask.shape[0] / (raw_cls_mask.shape[0] - 2.0)).astype(int)
-//    w, h = np.maximum(extended_box[2:] - extended_box[:2] + 1, 1)
-//    x0, y0 = np.clip(extended_box[:2], a_min=0, a_max=[im_w, im_h])
-//    x1, y1 = np.clip(extended_box[2:] + 1, a_min=0, a_max=[im_w, im_h])
-//
-//    raw_cls_mask = cv2.resize(raw_cls_mask, (w, h)) > 0.5
-//    mask = raw_cls_mask.astype(np.uint8)
-//    # Put an object mask in an image mask.
-//    im_mask = np.zeros((im_h, im_w), dtype=np.uint8)
-//    im_mask[y0:y1, x0:x1] = mask[(y0 - extended_box[1]):(y1 - extended_box[1]),
-//                            (x0 - extended_box[0]):(x1 - extended_box[0])]
-//    return im_mask
-
 cv::Rect expand_box(const cv::Rect2f& box, float scale) {
     float w_half = box.width * .5;
     float h_half = box.height * .5;
@@ -118,10 +87,6 @@ cv::Mat segm_postprocess(const cv::Rect2f& box, const cv::Mat& raw_cls_mask, int
     int y0 = std::min(std::max(extended_box.tl().y, 0), im_h);
     int x1 = std::min(std::max(extended_box.br().x + 1, 0), im_w);
     int y1 = std::min(std::max(extended_box.br().y + 1, 0), im_h);
-//    int x0 = std::clamp(extended_box.tl().x, 0, im_w);
-//    int y0 = std::clamp(extended_box.tl().y, 0, im_h);
-//    int x1 = std::clamp(extended_box.br().x + 1, 0, im_w);
-//    int y1 = std::clamp(extended_box.br().y + 1, 0, im_h);
 
     cv::resize(cls_mask, cls_mask, cv::Size(w, h));
     auto mask = cls_mask > 0.5;
@@ -130,11 +95,8 @@ cv::Mat segm_postprocess(const cv::Rect2f& box, const cv::Mat& raw_cls_mask, int
     im_mask(cv::Rect(cv::Point(x0, y0), cv::Point(x1, y1))) =
         mask(cv::Rect(cv::Point(x0 - extended_box.x, y0 - extended_box.y),
                       cv::Point(x1 - extended_box.x, y1 - extended_box.y)));
-//    im_mask[y0:y1, x0:x1] = mask[(y0 - extended_box[1]):(y1 - extended_box[1]),
-//                            (x0 - extended_box[0]):(x1 - extended_box[0])]
     return im_mask;
 }
-
 
 
 std::vector<cv::Scalar> color_palette {{0, 113, 188},
@@ -428,9 +390,6 @@ int main(int argc, char *argv[]) {
         std::string imageInputName, imageInfoInputName;
         size_t netInputHeight, netInputWidth;
 
-//        const string INPUT_IMAGE_BLOB_NAME = "im_data";
-//        const string INPUT_IMINFO_BLOB_NAME = "im_info";
-
         for (const auto & inputInfoItem : inputInfo) {
             if (inputInfoItem.second->getTensorDesc().getDims().size() == 4) {  // first input contains images
                 imageInputName = inputInfoItem.first;
@@ -458,13 +417,6 @@ int main(int argc, char *argv[]) {
         // --------------------------- Prepare output blobs -----------------------------------------------------
         slog::info << "Checking that the outputs are as the demo expects" << slog::endl;
         OutputsDataMap outputInfo(netReader.getNetwork().getOutputsInfo());
-//        if (outputInfo.size() != 1) {
-//            throw std::logic_error("This demo accepts networks having only one output");
-//        }
-//        DataPtr& output = outputInfo.begin()->second;
-//        auto outputName = outputInfo.begin()->first;
-//        const int num_classes = netReader.getNetwork().getLayerByName(outputName.c_str())->GetParamAsInt("num_classes");
-//        const int num_classes = 81;
 
         const SizeVector outputDims = outputInfo["raw_masks"]->getTensorDesc().getDims();
         const int maxDetectionsCount = outputDims[0];
@@ -588,24 +540,6 @@ int main(int argc, char *argv[]) {
 
                 ocv_decode_time = ocv_render_time;
                 ocv_render_time = ocv_decode_time;
-
-//                t0 = std::chrono::high_resolution_clock::now();
-//                std::ostringstream out;
-//                out << "OpenCV cap/render time: " << std::fixed << std::setprecision(2)
-//                    << (ocv_decode_time + ocv_render_time) << " ms";
-//                cv::putText(curr_frame, out.str(), cv::Point2f(0, 25), cv::FONT_HERSHEY_TRIPLEX, 0.6, cv::Scalar(0, 255, 0));
-//                out.str("");
-//                out << "Wallclock time " << (isAsyncMode ? "(TRUE ASYNC):      " : "(SYNC, press Tab): ");
-//                out << std::fixed << std::setprecision(2) << wall.count() << " ms (" << 1000.f / wall.count() << " fps)";
-//                cv::putText(curr_frame, out.str(), cv::Point2f(0, 50), cv::FONT_HERSHEY_TRIPLEX, 0.6, cv::Scalar(0, 0, 255));
-//                if (!isAsyncMode) {  // In the true async mode, there is no way to measure detection time directly
-//                    out.str("");
-//                    out << "Detection time  : " << std::fixed << std::setprecision(2) << detection.count()
-//                        << " ms ("
-//                        << 1000.f / detection.count() << " fps)";
-//                    cv::putText(curr_frame, out.str(), cv::Point2f(0, 75), cv::FONT_HERSHEY_TRIPLEX, 0.6,
-//                                cv::Scalar(255, 0, 0));
-//                }
 
                 // ---------------------------Process output blobs--------------------------------------------------
                 // Processing results of the CURRENT request
