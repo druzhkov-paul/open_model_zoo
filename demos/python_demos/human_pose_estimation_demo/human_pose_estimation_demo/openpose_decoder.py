@@ -51,6 +51,7 @@ class OpenPoseDecoder:
 
     def __call__(self, heatmaps, nms_heatmaps, pafs):
         pafs = np.transpose(pafs, (0, 2, 3, 1))
+        heatmaps = heatmaps[:, :-1]
 
         batch_size, _, h, w = heatmaps.shape
         hup = h * self.out_stride
@@ -64,20 +65,20 @@ class OpenPoseDecoder:
         keypoints = self.extract_points(heatmaps, nms_heatmaps)
         self.min_dist = min_dist
 
-        if self.high_res_heatmaps:
-            for kpts in keypoints:
-                self.scale_kpts(kpts, 1 / self.out_stride, (w - 1, h - 1))
+        # if self.high_res_heatmaps:
+        #     for kpts in keypoints:
+        #         self.scale_kpts(kpts, 1 / self.out_stride, (w - 1, h - 1))
 
-        if self.delta > 0:
-            # To adjust coordinates' flooring in heatmaps target generation.
-            for kpts in keypoints:
-                for kpt in kpts:
-                    kpt[0] = min(kpt[0] + self.delta, w - 1)
-                    kpt[1] = min(kpt[1] + self.delta, h - 1)
+        # if self.delta > 0:
+        #     # To adjust coordinates' flooring in heatmaps target generation.
+        #     for kpts in keypoints:
+        #         for kpt in kpts:
+        #             kpt[0] = min(kpt[0] + self.delta, w - 1)
+        #             kpt[1] = min(kpt[1] + self.delta, h - 1)
 
-        if self.high_res_pafs:
-            for kpts in keypoints:
-                self.scale_kpts(kpts, self.out_stride, (wup - 1, hup - 1))
+        # if self.high_res_pafs:
+        #     for kpts in keypoints:
+        #         self.scale_kpts(kpts, self.out_stride, (wup - 1, hup - 1))
 
         pose_entries, keypoints = self.group_keypoints(keypoints, pafs, pose_entry_size=self.num_joints + 2)
 
@@ -98,7 +99,7 @@ class OpenPoseDecoder:
     def extract_points(self, heatmaps, nms_heatmaps):
         batch_size, channels_num, h, w = heatmaps.shape
         assert batch_size == 1, 'Batch size of 1 only supported'
-        assert channels_num >= self.num_joints
+        assert channels_num >= self.num_joints, f'{channels_num} < {self.num_joints}'
 
         xs, ys, scores = self.top_k(nms_heatmaps)
 
@@ -117,15 +118,15 @@ class OpenPoseDecoder:
                 all_keypoints.append([])
                 continue
 
-            # Second stage of NMS.
-            xx = x[:, None] - x[None, :]
-            yy = y[:, None] - y[None, :]
-            dists = np.sqrt(xx * xx + yy * yy)
-            dists += np.tri(n, n, dtype=np.float32) * (2 * self.min_dist)
-            keep = dists.min(axis=0) >= self.min_dist
-            x = x[keep]
-            y = y[keep]
-            score = score[keep]
+            # # Second stage of NMS.
+            # xx = x[:, None] - x[None, :]
+            # yy = y[:, None] - y[None, :]
+            # dists = np.sqrt(xx * xx + yy * yy)
+            # dists += np.tri(n, n, dtype=np.float32) * (2 * self.min_dist)
+            # keep = dists.min(axis=0) >= self.min_dist
+            # x = x[keep]
+            # y = y[keep]
+            # score = score[keep]
 
             # Apply quarter offset to improve localization accuracy.
             x, y = self.refine(heatmaps[0, k], x, y)
@@ -172,13 +173,76 @@ class OpenPoseDecoder:
         x[valid] += dx
         y[valid] += dy
         return x, y
-      
-    
 
+    def update_poses(self, pose_entries, all_keypoints, connections, part_id, kpt_a_id, kpt_b_id, pose_entry_size=20):
+        if part_id == 0:
+            pose_entries = [np.full(pose_entry_size, -1) for _ in range(len(connections))]
+            for i in range(len(connections)):
+                pose_entries[i][kpt_a_id] = connections[i][0]
+                pose_entries[i][kpt_b_id] = connections[i][1]
+                pose_entries[i][-1] = 2
+                # pose score = sum of all points' scores + sum of all connections' scores
+                pose_entries[i][-2] = np.sum(all_keypoints[connections[i][0:2], 2]) + connections[i][2]
+        else:
+            for connection in connections:
+                pose_a_idx = -1
+                pose_b_idx = -1
+                for j, pose in enumerate(pose_entries):
+                    if pose[kpt_a_id] == connection[0]:
+                        pose_a_idx = j
+                    if pose[kpt_b_id] == connection[1]:
+                        pose_b_idx = j
+                if pose_a_idx < 0 and pose_b_idx < 0:
+                    # print('CREATE NEW POSE')
+                    # Create new pose entry.
+                    pose_entry = np.full(pose_entry_size, -1)
+                    pose_entry[kpt_a_id] = connection[0]
+                    pose_entry[kpt_b_id] = connection[1]
+                    pose_entry[-1] = 2
+                    pose_entry[-2] = np.sum(all_keypoints[connection[0:2], 2]) + connection[2]
+                    pose_entries.append(pose_entry)
+                elif pose_a_idx >= 0 and pose_b_idx >= 0 and pose_a_idx != pose_b_idx:
+                    # Merge two disjoint components into one pose.
+                    pose_a = pose_entries[pose_a_idx]
+                    pose_b = pose_entries[pose_b_idx]
+                    do_merge_poses = True
+                    for j in range(len(pose_b) - 2):
+                        if pose_a[j] >= 0 and pose_b[j] >= 0 and pose_a[j] != pose_b[j]:
+                            do_merge_poses = False
+                            break
+                    if not do_merge_poses:
+                        continue
+                    for j in range(len(pose_b) - 2):
+                        if pose_b[j] >= 0:
+                            pose_a[j] = pose_b[j]
+                    # pose_a[kpt_b_id] = connection[1]
+                    pose_a[-1] += pose_b[-1]
+                    pose_a[-2] += pose_b[-2] + connection[2]
+                    del pose_entries[pose_b_idx]
+                elif pose_a_idx >= 0:
+                    # Add a new bone into pose.
+                    pose = pose_entries[pose_a_idx]
+                    if pose[kpt_b_id] < 0:
+                        pose[-2] += all_keypoints[connection[1], 2]
+                    pose[kpt_b_id] = connection[1]
+                    pose[-2] += connection[2]
+                    pose[-1] += 1
+                elif pose_b_idx >= 0:
+                    # Add a new bone into pose.
+                    pose = pose_entries[pose_b_idx]
+                    if pose[kpt_a_id] < 0:
+                        pose[-2] += all_keypoints[connection[0], 2]
+                    pose[kpt_a_id] = connection[0]
+                    pose[-2] += connection[2]
+                    pose[-1] += 1
+        return pose_entries
+      
     def group_keypoints(self, all_keypoints_by_type, pafs, pose_entry_size=20, min_paf_score=0.05,
                         skeleton=BODY_PARTS_KPT_IDS, bones_to_channels=BODY_PARTS_PAF_IDS):
 
-        all_keypoints = np.asarray([item for sublist in all_keypoints_by_type for item in sublist], dtype=np.float32)
+        # all_keypoints = np.asarray([item for sublist in all_keypoints_by_type for item in sublist], dtype=np.float32)
+        # print(tuple(i.shape for i in all_keypoints_by_type))
+        all_keypoints = np.concatenate(all_keypoints_by_type, axis=0)
         pose_entries = []
 
         point_num = 10
@@ -190,14 +254,14 @@ class OpenPoseDecoder:
             kpt_a_id, kpt_b_id = skeleton[part_id]
             kpts_a = all_keypoints_by_type[kpt_a_id]
             kpts_b = all_keypoints_by_type[kpt_b_id]
-            num_kpts_a = len(kpts_a)
-            num_kpts_b = len(kpts_b)
+            num_kpts_a = kpts_a.shape[0]
+            num_kpts_b = kpts_b.shape[0]
             
             if num_kpts_a == 0 or num_kpts_b == 0:
                 continue
             
-            a = np.asarray([p[0:2] for p in kpts_a], dtype=np.float32)
-            b = np.asarray([p[0:2] for p in kpts_b], dtype=np.float32)
+            a = kpts_a[:, :2]
+            b = kpts_b[:, :2]
             n, m = len(a), len(b)
 
             a = np.broadcast_to(a[None], (m, n, 2))
@@ -223,7 +287,7 @@ class OpenPoseDecoder:
             b_idx, a_idx = np.divmod(valid_limbs, n)
             connections = []
             for t, i, j in zip(valid_limbs, a_idx, b_idx):
-                connections.append([i, j, score[t], score[t] + kpts_a[i][2] + kpts_b[j][2]])
+                connections.append([i, j, score[t], score[t] + kpts_a[i, 2] + kpts_b[j, 2]])
 
             if len(connections) > 0:
                 connections = sorted(connections, key=itemgetter(2), reverse=True)
@@ -237,7 +301,7 @@ class OpenPoseDecoder:
                     break
                 i, j, cur_point_score = connections[row][0:3]
                 if not has_kpt_a[i] and not has_kpt_b[j]:
-                    filtered_connections.append([int(kpts_a[i][3]), int(kpts_b[j][3]), cur_point_score])
+                    filtered_connections.append([int(kpts_a[i, 3]), int(kpts_b[j, 3]), cur_point_score])
                     has_kpt_a[i] = 1
                     has_kpt_b[j] = 1
             connections = filtered_connections
@@ -247,67 +311,8 @@ class OpenPoseDecoder:
             # for i in range(len(connections)):
             #     pose_entries.append(init_pose(kpt_a_id, kpt_b_id, connections[i]))
             # continue
-
-            if part_id == 0:
-                pose_entries = [np.full(pose_entry_size, -1) for _ in range(len(connections))]
-                for i in range(len(connections)):
-                    pose_entries[i][kpt_a_id] = connections[i][0]
-                    pose_entries[i][kpt_b_id] = connections[i][1]
-                    pose_entries[i][-1] = 2
-                    # pose score = sum of all points' scores + sum of all connections' scores
-                    pose_entries[i][-2] = np.sum(all_keypoints[connections[i][0:2], 2]) + connections[i][2]
-            else:
-                for connection in connections:
-                    pose_a_idx = -1
-                    pose_b_idx = -1
-                    for j, pose in enumerate(pose_entries):
-                        if pose[kpt_a_id] == connection[0]:
-                            pose_a_idx = j
-                        if pose[kpt_b_id] == connection[1]:
-                            pose_b_idx = j
-                    if pose_a_idx < 0 and pose_b_idx < 0:
-                        # print('CREATE NEW POSE')
-                        # Create new pose entry.
-                        pose_entry = np.full(pose_entry_size, -1)
-                        pose_entry[kpt_a_id] = connection[0]
-                        pose_entry[kpt_b_id] = connection[1]
-                        pose_entry[-1] = 2
-                        pose_entry[-2] = np.sum(all_keypoints[connection[0:2], 2]) + connection[2]
-                        pose_entries.append(pose_entry)
-                    elif pose_a_idx >= 0 and pose_b_idx >= 0 and pose_a_idx != pose_b_idx:
-                        # Merge two disjoint components into one pose.
-                        pose_a = pose_entries[pose_a_idx]
-                        pose_b = pose_entries[pose_b_idx]
-                        do_merge_poses = True
-                        for j in range(len(pose_b) - 2):
-                            if pose_a[j] >= 0 and pose_b[j] >= 0 and pose_a[j] != pose_b[j]:
-                                do_merge_poses = False
-                                break
-                        if not do_merge_poses:
-                            continue
-                        for j in range(len(pose_b) - 2):
-                            if pose_b[j] >= 0:
-                                pose_a[j] = pose_b[j]
-                        # pose_a[kpt_b_id] = connection[1]
-                        pose_a[-1] += pose_b[-1]
-                        pose_a[-2] += pose_b[-2] + connection[2]
-                        del pose_entries[pose_b_idx]
-                    elif pose_a_idx >= 0:
-                        # Add a new bone into pose.
-                        pose = pose_entries[pose_a_idx]
-                        if pose[kpt_b_id] < 0:
-                            pose[-2] += all_keypoints[connection[1], 2]
-                        pose[kpt_b_id] = connection[1]
-                        pose[-2] += connection[2]
-                        pose[-1] += 1
-                    elif pose_b_idx >= 0:
-                        # Add a new bone into pose.
-                        pose = pose_entries[pose_b_idx]
-                        if pose[kpt_a_id] < 0:
-                            pose[-2] += all_keypoints[connection[0], 2]
-                        pose[kpt_a_id] = connection[0]
-                        pose[-2] += connection[2]
-                        pose[-1] += 1
+            pose_entries = self.update_poses(pose_entries, all_keypoints, connections, part_id, kpt_a_id, kpt_b_id)
+            
 
         filtered_entries = []
         for i in range(len(pose_entries)):
