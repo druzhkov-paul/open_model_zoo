@@ -262,21 +262,12 @@ class OpenPoseDecoder:
         return x, y
 
     @staticmethod
-    def merge_poses(pose_a, pose_b):
-        do_merge_poses = True
-        for j in range(len(pose_b) - 2):
-            if pose_a[j] >= 0 and pose_b[j] >= 0 and pose_a[j] != pose_b[j]:
-                do_merge_poses = False
-                break
-        if not do_merge_poses:
-            return False
-        for j in range(len(pose_b) - 2):
-            if pose_b[j] >= 0:
-                pose_a[j] = pose_b[j]
-        pose_a[-1] += pose_b[-1]
-        return True
+    def is_disjoint(pose_a, pose_b):
+        pose_a = pose_a[:-2]
+        pose_b = pose_b[:-2]
+        return np.all(np.logical_or.reduce((pose_a == pose_b, pose_a < 0, pose_b < 0)))
 
-    def update_poses(self, part_id, kpt_a_id, kpt_b_id, all_keypoints, connections, pose_entries, pose_entry_size):
+    def update_poses(self, kpt_a_id, kpt_b_id, all_keypoints, connections, pose_entries, pose_entry_size):
         for connection in connections:
             pose_a_idx = -1
             pose_b_idx = -1
@@ -287,18 +278,20 @@ class OpenPoseDecoder:
                     pose_b_idx = j
             if pose_a_idx < 0 and pose_b_idx < 0:
                 # Create new pose entry.
-                pose_entry = np.full(pose_entry_size, -1)
+                pose_entry = np.full(pose_entry_size, -1, dtype=np.float32)
                 pose_entry[kpt_a_id] = connection[0]
                 pose_entry[kpt_b_id] = connection[1]
                 pose_entry[-1] = 2
                 pose_entry[-2] = np.sum(all_keypoints[connection[0:2], 2]) + connection[2]
                 pose_entries.append(pose_entry)
             elif pose_a_idx >= 0 and pose_b_idx >= 0 and pose_a_idx != pose_b_idx:
-                # Merge two disjoint components into one pose.
+                # Merge two poses are disjoint merge them, otherwise ignore connection.
                 pose_a = pose_entries[pose_a_idx]
                 pose_b = pose_entries[pose_b_idx]
-                if self.merge_poses(pose_a, pose_b):
-                    pose_a[-2] += pose_b[-2] + connection[2]
+                if self.is_disjoint(pose_a, pose_b):
+                    pose_a += pose_b
+                    pose_a[:-2] += 1
+                    pose_a[-2] += connection[2]
                     del pose_entries[pose_b_idx]
             elif pose_a_idx >= 0 and pose_b_idx >= 0:
                 # Adjust score of a pose.
