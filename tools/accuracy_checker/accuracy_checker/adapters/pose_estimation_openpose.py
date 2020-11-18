@@ -353,28 +353,32 @@ class OpenPoseDecoder:
 
             # Get a list of limbs according to the obtained affinity score.
             valid_limbs = np.where(np.logical_and(affinity_scores > 0, success_ratio > 0.8))[0]
-            affinity_scores = affinity_scores[valid_limbs]
-            b_idx, a_idx = np.divmod(valid_limbs, n)
-            if len(affinity_scores) == 0:
+            if len(valid_limbs) == 0:
                 continue
+            b_idx, a_idx = np.divmod(valid_limbs, n)
+            affinity_scores = affinity_scores[valid_limbs]
 
             # From all retrieved connections that share starting/ending keypoints leave only the top-scoring ones.
             order = affinity_scores.argsort()[::-1]
             affinity_scores = affinity_scores[order]
             a_idx = a_idx[order]
             b_idx = b_idx[order]
-            a_idx_unique = np.unique(a_idx, return_index=True)[1]
-            b_idx_unique = np.unique(b_idx, return_index=True)[1]
-            idx = np.intersect1d(a_idx_unique, b_idx_unique, assume_unique=True)
+            idx = []
+            has_kpt_a = np.zeros(n, dtype=np.bool)
+            has_kpt_b = np.zeros(m, dtype=np.bool)
+            for t, (i, j) in enumerate(zip(a_idx, b_idx)):
+                if not has_kpt_a[i] and not has_kpt_b[j]:
+                    idx.append(t)
+                    has_kpt_a[i] = has_kpt_b[j] = True
+            idx = np.asarray(idx, dtype=np.int32)
             a = kpts_a[a_idx[idx], 3].astype(np.int32)
             b = kpts_b[b_idx[idx], 3].astype(np.int32)
             connections = list(zip(a, b, affinity_scores[idx]))
-
             if len(connections) == 0:
                 continue
 
             # Update poses with new connections.
-            pose_entries = self.update_poses(part_id, kpt_a_id, kpt_b_id, all_keypoints,
+            pose_entries = self.update_poses(kpt_a_id, kpt_b_id, all_keypoints,
                                              connections, pose_entries, pose_entry_size)
 
         # Remove poses with not enough points.
