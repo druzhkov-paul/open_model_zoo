@@ -322,12 +322,13 @@ class OpenPoseDecoder:
         a_idx = a_idx[order]
         b_idx = b_idx[order]
         idx = []
-        has_kpt_a = np.zeros(n, dtype=np.bool)
-        has_kpt_b = np.zeros(m, dtype=np.bool)
+        has_kpt_a = set()
+        has_kpt_b = set()
         for t, (i, j) in enumerate(zip(a_idx, b_idx)):
-            if not has_kpt_a[i] and not has_kpt_b[j]:
+            if i not in has_kpt_a and j not in has_kpt_b:
                 idx.append(t)
-                has_kpt_a[i] = has_kpt_b[j] = True
+                has_kpt_a.add(i)
+                has_kpt_b.add(j)
         idx = np.asarray(idx, dtype=np.int32)
         return a_idx[idx], b_idx[idx], affinity_scores[idx]
 
