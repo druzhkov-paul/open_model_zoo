@@ -65,7 +65,8 @@ class OpenPoseAdapter(Adapter):
             self._part_affinity_fields_bias = self.part_affinity_fields + '/add_'
 
         self.decoder = OpenPoseDecoder(num_joints=18, delta=0.5 if self.upscale_factor == 1 else 0.0)
-        self.nms = HeatmapNMS(kernel=2 * int(np.round(6 / 7 * self.upscale_factor)) + 1)
+        # self.nms = HeatmapNMS(kernel=2 * int(np.round(6 / 7 * self.upscale_factor)) + 1)
+        self.nms = HeatmapNMSPyTorch(kernel=2 * int(np.round(6 / 7 * self.upscale_factor)) + 1, device='cuda')
 
     def process(self, raw, identifiers, frame_meta):
         result = []
@@ -156,6 +157,20 @@ class HeatmapNMS:
     def __call__(self, heatmaps):
         pooled = self.max_pool(heatmaps)
         return heatmaps * (pooled == heatmaps).astype(heatmaps.dtype)
+
+
+class HeatmapNMSPyTorch:
+    def __init__(self, kernel, device='cpu'):
+        self.kernel = kernel
+        self.pad = (kernel - 1) // 2
+        self.device = device
+
+    def __call__(self, heatmaps):
+        import torch
+        heatmaps = torch.as_tensor(heatmaps, device=self.device)
+        maxm = torch.nn.functional.max_pool2d(heatmaps, kernel_size=self.kernel, stride=1, padding=self.pad)
+        maxm = torch.eq(maxm, heatmaps).float()
+        return (heatmaps * maxm).cpu().numpy()
 
 
 class OpenPoseDecoder:
