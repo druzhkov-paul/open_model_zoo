@@ -314,6 +314,23 @@ class OpenPoseDecoder:
                 pose[-1] += 1
         return pose_entries
 
+    @staticmethod
+    def connections_nms(a_idx, b_idx, affinity_scores):
+        # From all retrieved connections that share starting/ending keypoints leave only the top-scoring ones.
+        order = affinity_scores.argsort()[::-1]
+        affinity_scores = affinity_scores[order]
+        a_idx = a_idx[order]
+        b_idx = b_idx[order]
+        idx = []
+        has_kpt_a = np.zeros(n, dtype=np.bool)
+        has_kpt_b = np.zeros(m, dtype=np.bool)
+        for t, (i, j) in enumerate(zip(a_idx, b_idx)):
+            if not has_kpt_a[i] and not has_kpt_b[j]:
+                idx.append(t)
+                has_kpt_a[i] = has_kpt_b[j] = True
+        idx = np.asarray(idx, dtype=np.int32)
+        return a_idx[idx], b_idx[idx], affinity_scores[idx]
+
     def group_keypoints(self, all_keypoints_by_type, pafs, pose_entry_size=20):
         all_keypoints = np.concatenate(all_keypoints_by_type, axis=0)
         pose_entries = []
@@ -358,22 +375,11 @@ class OpenPoseDecoder:
             b_idx, a_idx = np.divmod(valid_limbs, n)
             affinity_scores = affinity_scores[valid_limbs]
 
-            # From all retrieved connections that share starting/ending keypoints leave only the top-scoring ones.
-            order = affinity_scores.argsort()[::-1]
-            affinity_scores = affinity_scores[order]
-            a_idx = a_idx[order]
-            b_idx = b_idx[order]
-            idx = []
-            has_kpt_a = np.zeros(n, dtype=np.bool)
-            has_kpt_b = np.zeros(m, dtype=np.bool)
-            for t, (i, j) in enumerate(zip(a_idx, b_idx)):
-                if not has_kpt_a[i] and not has_kpt_b[j]:
-                    idx.append(t)
-                    has_kpt_a[i] = has_kpt_b[j] = True
-            idx = np.asarray(idx, dtype=np.int32)
-            a = kpts_a[a_idx[idx], 3].astype(np.int32)
-            b = kpts_b[b_idx[idx], 3].astype(np.int32)
-            connections = list(zip(a, b, affinity_scores[idx]))
+            # Suppress incompatible connections.
+            a_idx, b_idx, affinity_scores = self.connections_nms(a_idx, b_idx, affinity_scores)
+            connections = list(zip(kpts_a[a_idx, 3].astype(np.int32),
+                                   kpts_b[b_idx, 3].astype(np.int32),
+                                   affinity_scores))
             if len(connections) == 0:
                 continue
 
