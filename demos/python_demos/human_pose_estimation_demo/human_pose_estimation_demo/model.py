@@ -1,3 +1,19 @@
+"""
+ Copyright (C) 2020 Intel Corporation
+
+ Licensed under the Apache License, Version 2.0 (the "License");
+ you may not use this file except in compliance with the License.
+ You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+ Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+ limitations under the License.
+"""
+
 import logging
 import os.path as osp
 import threading
@@ -16,6 +32,7 @@ log = logging.getLogger()
 
 class Model:
     def __init__(self, ie, xml_file_path, bin_file_path=None,
+                 size_divisor=8, target_size=None,
                  device='CPU', plugin_config={}, max_num_requests=1,
                  results=None, caught_exceptions=None):
         self.ie = ie
@@ -28,8 +45,11 @@ class Model:
         self.max_num_requests = max_num_requests
         self.device = device
         self.plugin_config = plugin_config
-        self.input_shapes = {}
         self.exec_net = ie.load_network(network=self.net, device_name=device, config=plugin_config, num_requests=max_num_requests)
+
+        self.image_blob_name = ''
+        self.size_divisor = size_divisor
+        self.target_size = target_size
 
         self.requests = self.exec_net.requests
         self.empty_requests = deque(self.requests)
@@ -46,7 +66,7 @@ class Model:
                 reshape_needed = True
                 break
         if reshape_needed:
-            print('reshape net to ', input_shapes)
+            log.info('reshape net to {}'.format(input_shapes))
             self.await_all()
             self.net.reshape(input_shapes)
             self.exec_net = self.ie.load_network(network=self.net, device_name=self.device, num_requests=self.max_num_requests)
@@ -60,8 +80,37 @@ class Model:
             inputs_dict = inputs
         return inputs_dict
 
+    @staticmethod
+    def _get_inputs(net):
+        image_blob_name = None
+        for blob_name, blob in net.input_info.items():
+            if len(blob.input_data.shape) == 4:
+                image_blob_name = blob_name
+            else:
+                raise RuntimeError('Unsupported {}D input layer "{}". Only 2D and 4D input layers are supported'
+                                   .format(len(blob.shape), blob_name))
+        if image_blob_name is None:
+            raise RuntimeError('Failed to identify the input for the image.')
+        return image_blob_name
+
+    @staticmethod
+    def _resize_image(frame, size):
+        return cv2.resize(frame, (size, size))
+
     def preprocess(self, inputs):
-        meta = {}
+        img = self._resize_image(inputs[self.image_blob_name], self.target_size)
+        meta = {'original_shape': inputs[self.image_blob_name].shape,
+                'resized_shape': img.shape}
+        h, w = img.shape[:2]
+        divisor = self.size_divisor
+        if w % divisor != 0 or h % divisor != 0:
+            img = np.pad(img, ((0, (h + divisor - 1) // divisor * divisor - h),
+                               (0, (w + divisor - 1) // divisor * divisor - w),
+                               (0, 0)),
+                         mode='constant', constant_values=0)
+        # Change data layout from HWC to CHW
+        img = img.transpose((2, 0, 1))
+        inputs[self.image_blob_name] = img[None]
         return inputs, meta
 
     def postprocess(self, outputs, meta):
@@ -100,19 +149,20 @@ class Model:
 
 class HPEOpenPose(Model):
 
-    def __init__(self, *args, size_divisor=8,
-                 target_size=None, upsample_ratio=1, use_cpp_postprocessing=False,
-                 device='CPU', max_num_requests=1, **kwargs):
+    def __init__(self, *args, upsample_ratio=1, **kwargs):
         super().__init__(*args, **kwargs)
 
-        self.use_cpp_postprocessing = use_cpp_postprocessing
-        self.nms_heatmaps_blob_name = None
+        self.pooled_heatmaps_blob_name = 'pooled_heatmaps'
+        self.heatmaps_blob_name = 'heatmaps'
+        self.pafs_blob_name = 'pafs'
+
         function = ng.function_from_cnn(self.net)
         paf = function.get_output_op(0)
         paf = paf.inputs()[0].get_source_output().get_node()
-        paf.set_friendly_name('pafs')
+        paf.set_friendly_name(self.pafs_blob_name)
         heatmap = function.get_output_op(1)
         heatmap = heatmap.inputs()[0].get_source_output().get_node()
+<<<<<<< HEAD
         heatmap.set_friendly_name('heatmaps')
         if not self.use_cpp_postprocessing:
             # Add keypoints NMS to the network.
@@ -135,62 +185,51 @@ class HPEOpenPose(Model):
             f = ng.impl.Function(
                 [ng.result(heatmap, name='heatmaps'), ng.result(paf, name='pafs')],
                 function.get_parameters(), 'hpe')
+=======
+        heatmap.set_friendly_name(self.heatmaps_blob_name)
 
+        # Add keypoints NMS to the network.
+        # Heuristic NMS kernel size adjustment depending on the feature maps upsampling ratio.
+        p = int(np.round(6 / 7 * upsample_ratio))
+        k = 2 * p + 1
+        pooled_heatmap = ng.max_pool(heatmap, kernel_shape=(k, k), pads_begin=(p, p), pads_end=(p, p),
+                                     strides=(1, 1), name=self.pooled_heatmaps_blob_name)
+        f = ng.impl.Function(
+            [ng.result(heatmap, name=self.heatmaps_blob_name),
+             ng.result(pooled_heatmap, name=self.pooled_heatmaps_blob_name),
+             ng.result(paf, name=self.pafs_blob_name)],
+            function.get_parameters(), 'hpe')
+>>>>>>> 2116b47abd2c912c3655b7d798f1350656c88914
+
+        self.image_blob_name = self._get_inputs(self.net)
         self.net = IENetwork(ng.impl.Function.to_capsule(f))
         self.exec_net = self.ie.load_network(network=self.net, device_name=self.device, num_requests=self.max_num_requests)
         self.requests = self.exec_net.requests
         self.empty_requests = deque(self.requests)
 
-        self.image_blob_name = self._get_inputs(self.net)
-        self.pafs_blob_name = 'pafs'
-        self.heatmaps_blob_name = 'heatmaps'
-
         self.num_joints = self.net.outputs[self.heatmaps_blob_name].shape[1] - 1  # The last channel is for background.
-        self.size_divisor = size_divisor
-        self.target_size = self.net.input_info[self.image_blob_name].input_data.shape[-2]
-        self.output_scale = self.target_size / self.net.outputs[self.heatmaps_blob_name].shape[-2]
-        if target_size is not None:
+        target_size = self.net.input_info[self.image_blob_name].input_data.shape[-2]
+        self.output_scale = target_size / self.net.outputs[self.heatmaps_blob_name].shape[-2]
+        if self.target_size is None:
             self.target_size = target_size
 
         self.decoder = OpenPoseDecoder(num_joints=self.num_joints)
 
-    def _get_inputs(self, net):
-        image_blob_name = None
-        for blob_name, blob in net.input_info.items():
-            if len(blob.input_data.shape) == 4:
-                image_blob_name = blob_name
-            else:
-                raise RuntimeError('Unsupported {}D input layer "{}". Only 2D and 4D input layers are supported'
-                                   .format(len(blob.shape), blob_name))
-        if image_blob_name is None:
-            raise RuntimeError('Failed to identify the input for the image.')
-        return image_blob_name
+    @staticmethod
+    def heatmap_nms(heatmaps, pooled_heatmaps):
+        return heatmaps * (heatmaps == pooled_heatmaps)
 
     @staticmethod
     def _resize_image(frame, size):
-        h, w = frame.shape[:2]
-        scale = max(size[1] / h, size[0] / w)
+        h = frame.shape[0]
+        scale = size / h
         resized_frame = cv2.resize(frame, None, fx=scale, fy=scale)
         return resized_frame
-
-    def preprocess(self, inputs):
-        img = self._resize_image(inputs[self.image_blob_name], (self.target_size, self.target_size))
-        meta = {'original_shape': inputs[self.image_blob_name].shape,
-                'resized_shape': img.shape}
-        h, w = img.shape[:2]
-        divisor = self.size_divisor
-        if w % divisor != 0 or h % divisor != 0:
-            img = np.pad(img, ((0, (h + divisor - 1) // divisor * divisor - h),
-                               (0, (w + divisor - 1) // divisor * divisor - w),
-                               (0, 0)))
-        # Change data layout from HWC to CHW
-        img = img.transpose((2, 0, 1))
-        inputs[self.image_blob_name] = img[None]
-        return inputs, meta
 
     def postprocess(self, outputs, meta):
         heatmaps = outputs[self.heatmaps_blob_name]
         pafs = outputs[self.pafs_blob_name]
+<<<<<<< HEAD
 
         if self.use_cpp_postprocessing:
             from pose_extractor import extract_poses
@@ -206,6 +245,11 @@ class HPEOpenPose(Model):
             nms_heatmaps = outputs[self.nms_heatmaps_blob_name]
             poses, scores = self.decoder(heatmaps, nms_heatmaps, pafs)
 
+=======
+        pooled_heatmaps = outputs[self.pooled_heatmaps_blob_name]
+        nms_heatmaps = self.heatmap_nms(heatmaps, pooled_heatmaps)
+        poses, scores = self.decoder(heatmaps, nms_heatmaps, pafs)
+>>>>>>> 2116b47abd2c912c3655b7d798f1350656c88914
         # Rescale poses to the original image.
         original_image_shape = meta['original_shape']
         resized_image_shape = meta['resized_shape']
@@ -218,19 +262,19 @@ class HPEOpenPose(Model):
 
 class HPEAssociativeEmbedding(Model):
 
-    def __init__(self, *args, target_size=None, size_divisor=32, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, *args, size_divisor=32, **kwargs):
+        super().__init__(*args, size_divisor=size_divisor, **kwargs)
 
         self.image_blob_name = self._get_inputs(self.net)
         self.heatmaps_blob_name = find_layer_by_name('heatmaps', self.net.outputs)
         self.nms_heatmaps_blob_name = find_layer_by_name('nms_heatmaps', self.net.outputs)
         self.embeddings_blob_name = find_layer_by_name('embeddings', self.net.outputs)
 
-        self.size_divisor = size_divisor
         self.num_joints = self.net.outputs[self.heatmaps_blob_name].shape[1]
-        self.target_size = self.net.input_info[self.image_blob_name].input_data.shape[-1]
-        self.output_scale = self.target_size / self.net.outputs[self.heatmaps_blob_name].shape[-1]
-        if target_size is not None:
+        h, w = self.net.input_info[self.image_blob_name].input_data.shape[-2:]
+        target_size = min(h, w)
+        self.output_scale = target_size / self.net.outputs[self.heatmaps_blob_name].shape[-1]
+        if self.target_size is None:
             self.target_size = target_size
 
         self.decoder = AssociativeEmbeddingDecoder(
@@ -244,39 +288,12 @@ class HPEAssociativeEmbedding(Model):
             use_detection_val=True,
             ignore_too_much=False)
 
-    def _get_inputs(self, net):
-        image_blob_name = None
-        for blob_name, blob in net.input_info.items():
-            if len(blob.input_data.shape) == 4:
-                image_blob_name = blob_name
-            else:
-                raise RuntimeError('Unsupported {}D input layer "{}". Only 2D and 4D input layers are supported'
-                                   .format(len(blob.shape), blob_name))
-        if image_blob_name is None:
-            raise RuntimeError('Failed to identify the input for the image.')
-        return image_blob_name
-
     @staticmethod
     def _resize_image(frame, size):
         h, w = frame.shape[:2]
-        scale = max(size[1] / h, size[0] / w)
+        scale = max(size / h, size / w)
         resized_frame = cv2.resize(frame, None, fx=scale, fy=scale)
         return resized_frame
-
-    def preprocess(self, inputs):
-        img = self._resize_image(inputs[self.image_blob_name], (self.target_size, self.target_size))
-        meta = {'original_shape': inputs[self.image_blob_name].shape,
-                'resized_shape': img.shape}
-        h, w = img.shape[:2]
-        divisor = self.size_divisor
-        if w % divisor != 0 or h % divisor != 0:
-            img = np.pad(img, ((0, (h + divisor - 1) // divisor * divisor - h),
-                               (0, (w + divisor - 1) // divisor * divisor - w),
-                               (0, 0)))
-        # Change data layout from HWC to CHW
-        img = img.transpose((2, 0, 1))
-        inputs[self.image_blob_name] = img[None]
-        return inputs, meta
 
     def postprocess(self, outputs, meta):
         heatmaps = outputs[self.heatmaps_blob_name]

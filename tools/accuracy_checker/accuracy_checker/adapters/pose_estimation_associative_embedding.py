@@ -15,12 +15,16 @@ limitations under the License.
 """
 
 import numpy as np
-from scipy.optimize import linear_sum_assignment
 
 from ..adapters import Adapter
 from ..config import ConfigValidator, StringField, ConfigError
 from ..representation import PoseEstimationPrediction
-from ..utils import contains_all
+from ..utils import contains_all, UnsupportedPackage
+
+try:
+    from scipy.optimize import linear_sum_assignment
+except ImportError as error:
+    linear_sum_assignment = UnsupportedPackage('scipy.optimize', error.msg)
 
 
 class AssociativeEmbeddingAdapter(Adapter):
@@ -182,7 +186,12 @@ class AssociativeEmbeddingDecoder:
             num_added = diff.shape[0]
             num_grouped = diff.shape[1]
             if num_added > num_grouped:
+<<<<<<< HEAD
                 diff_normed = np.pad(diff_normed, ((0, 0), (0, num_added - num_grouped)), constant_values=1e10)
+=======
+                diff_normed = np.pad(diff_normed, ((0, 0), (0, num_added - num_grouped)),
+                                     mode='constant', constant_values=1e10)
+>>>>>>> 2116b47abd2c912c3655b7d798f1350656c88914
 
             pairs = self._max_match(diff_normed)
             for row, col in pairs:
@@ -250,23 +259,17 @@ class AssociativeEmbeddingDecoder:
                     tags.append(tag[i, y, x])
             prev_tag = np.mean(tags, axis=0)
 
-        # Allocate the buffer for tags similarity matrix.
-        tag_copy = np.empty_like(tag[0, ..., 0])
         for i, (_heatmap, _tag) in enumerate(zip(heatmap, tag)):
             if keypoints[i, 2] > 0:
                 continue
-            tag_copy[...] = _tag[..., 0]
-            diff = tag_copy
-            diff -= prev_tag
-            np.abs(diff, out=diff)
-            np.floor(diff + 0.5, out=diff)
+            # Get position with the closest tag value to the pose tag.
+            diff = np.abs(_tag[..., 0] - prev_tag) + 0.5
+            diff = diff.astype(np.int32).astype(_heatmap.dtype)
             diff -= _heatmap
             idx = diff.argmin()
             y, x = np.divmod(idx, _heatmap.shape[-1])
-
-            # detection score at maximum position
+            # Corresponding keypoint detection score.
             val = _heatmap[y, x]
-
             if val > 0:
                 keypoints[i, :3] = x, y, val
                 if 1 < x < W - 1 and 1 < y < H - 1:
